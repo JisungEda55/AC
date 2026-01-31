@@ -2,32 +2,63 @@
 <html lang="ko">
 <head>
     <meta charset="UTF-8">
-    <title>Whisper WASM 자막 생성기 (서버 없음/키 없음)</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Pro 자막 생성기 (No Server / No API)</title>
     <script src="https://cdn.jsdelivr.net/npm/@ffmpeg/ffmpeg@0.12.10/dist/umd/ffmpeg.umd.min.js"></script>
     <script src="https://cdn.jsdelivr.net/npm/@ffmpeg/util@0.12.1/dist/umd/index.min.js"></script>
     <style>
-        body { font-family: sans-serif; padding: 20px; background: #f0f2f5; }
-        .card { background: white; padding: 20px; border-radius: 10px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); max-width: 700px; margin: auto; }
-        #status { color: #007bff; font-weight: bold; margin: 10px 0; }
-        pre { background: #333; color: #fff; padding: 15px; border-radius: 5px; height: 200px; overflow-y: auto; font-size: 12px; }
-        button { padding: 10px 20px; cursor: pointer; border: none; border-radius: 5px; background: #28a745; color: white; }
-        button:disabled { background: #ccc; }
+        :root { --primary: #4A90E2; --bg: #f8f9fa; }
+        body { font-family: 'Pretendard', sans-serif; background: var(--bg); padding: 20px; display: flex; justify-content: center; }
+        .container { background: white; width: 100%; max-width: 800px; padding: 30px; border-radius: 16px; box-shadow: 0 10px 30px rgba(0,0,0,0.05); }
+        h1 { font-size: 1.5rem; color: #333; margin-bottom: 20px; text-align: center; }
+        
+        .upload-box { border: 2px dashed #ddd; padding: 40px; text-align: center; border-radius: 12px; transition: 0.3s; margin-bottom: 20px; }
+        .upload-box:hover { border-color: var(--primary); background: #f0f7ff; }
+        
+        .status-area { margin: 20px 0; }
+        .progress-container { height: 10px; background: #eee; border-radius: 5px; overflow: hidden; margin-bottom: 10px; display: none; }
+        #progressBar { height: 100%; background: var(--primary); width: 0%; transition: width 0.3s; }
+        #statusText { font-size: 0.9rem; color: #666; text-align: center; }
+
+        .controls { display: flex; gap: 10px; margin-bottom: 20px; }
+        select, button { padding: 12px; border-radius: 8px; border: 1px solid #ddd; font-size: 1rem; }
+        button { flex: 1; background: var(--primary); color: white; border: none; font-weight: bold; cursor: pointer; }
+        button:disabled { background: #ccc; cursor: not-allowed; }
+        #downloadBtn { background: #28a745; }
+
+        pre { background: #2d2d2d; color: #adbac7; padding: 15px; border-radius: 8px; height: 250px; overflow-y: auto; font-family: monospace; font-size: 0.85rem; }
     </style>
 </head>
 <body>
 
-<div class="card">
-    <h2>🎥 브라우저 단독 자막 생성기</h2>
-    <p>서버 통신 없이 브라우저 안에서 AI가 작동합니다.</p>
-    
-    <input type="file" id="videoInput" accept="video/*">
-    <div id="status">파일을 선택해 주세요.</div>
-    
-    <button id="startBtn">자막 생성 시작</button>
-    <button id="downloadBtn" disabled>SRT 다운로드</button>
+<div class="container">
+    <h1>🎙️ AI 자막 생성 스튜디오</h1>
 
-    <h3>미리보기</h3>
-    <pre id="output">자막이 생성되면 여기에 표시됩니다.</pre>
+    <div class="upload-box" id="dropZone">
+        <input type="file" id="videoInput" accept="video/*" style="display: none;">
+        <p id="fileName">동영상 파일을 선택하거나 이리로 끌어다 놓으세요.</p>
+        <button onclick="document.getElementById('videoInput').click()">파일 찾기</button>
+    </div>
+
+    <div class="controls">
+        <select id="languageSelect">
+            <option value="korean">한국어</option>
+            <option value="english">영어</option>
+            <option value="auto">언어 자동 감지</option>
+        </select>
+        <button id="startBtn">자막 생성 시작</button>
+        <button id="downloadBtn" disabled>SRT 다운로드</button>
+    </div>
+
+    <div class="status-area">
+        <div class="progress-container" id="progressContainer">
+            <div id="progressBar"></div>
+        </div>
+        <div id="statusText">준비 완료</div>
+    </div>
+
+    <h3>자막 미리보기</h3>
+    <pre id="output">이곳에 실시간 로그와 자막이 표시됩니다.</pre>
 </div>
 
 <script type="module">
@@ -37,60 +68,85 @@
 
     const startBtn = document.getElementById('startBtn');
     const downloadBtn = document.getElementById('downloadBtn');
-    const status = document.getElementById('status');
+    const statusText = document.getElementById('statusText');
+    const progressBar = document.getElementById('progressBar');
+    const progressContainer = document.getElementById('progressContainer');
     const output = document.getElementById('output');
+    const videoInput = document.getElementById('videoInput');
 
     let finalSrt = "";
 
+    // 파일 선택 이벤트
+    videoInput.onchange = (e) => {
+        const file = e.target.files[0];
+        if (file) document.getElementById('fileName').innerText = file.name;
+    };
+
+    // 로그 업데이트 함수
+    function log(msg) {
+        const now = new Date().toLocaleTimeString();
+        output.innerText += `\n[${now}] ${msg}`;
+        output.scrollTop = output.scrollHeight;
+    }
+
     startBtn.onclick = async () => {
-        const file = document.getElementById('videoInput').files[0];
-        if (!file) return alert("동영상을 먼저 선택하세요.");
+        const file = videoInput.files[0];
+        if (!file) return alert("동영상을 먼저 선택해 주세요.");
 
         try {
             startBtn.disabled = true;
-            
-            // 1. FFmpeg 로드 (WASM 파일들 가져오기)
+            progressContainer.style.display = "block";
+            output.innerText = "계산 시작...";
+
+            // 1. FFmpeg 로드
             if (!ffmpeg.loaded) {
-                status.innerText = "⏳ FFmpeg 로딩 중...";
+                statusText.innerText = "라이브러리 로딩 중...";
                 await ffmpeg.load({
                     coreURL: await toBlobURL('https://cdn.jsdelivr.net/npm/@ffmpeg/core@0.12.6/dist/umd/ffmpeg-core.js', 'text/javascript'),
                     wasmURL: await toBlobURL('https://cdn.jsdelivr.net/npm/@ffmpeg/core@0.12.6/dist/umd/ffmpeg-core.wasm', 'application/wasm'),
                 });
             }
 
-            // 2. 비디오에서 오디오 추출 (WASM 내부 파일 시스템 이용)
-            status.innerText = "🔊 오디오 추출 중...";
-            await ffmpeg.writeFile('input', await fetchFile(file));
-            await ffmpeg.exec(['-i', 'input', '-ar', '16000', '-ac', '1', 'output.wav']);
+            // 2. 오디오 추출
+            log("동영상에서 오디오 추출 중...");
+            statusText.innerText = "오디오 추출 중...";
+            await ffmpeg.writeFile('input_file', await fetchFile(file));
+            await ffmpeg.exec(['-i', 'input_file', '-ar', '16000', '-ac', '1', 'output.wav']);
             const audioData = await ffmpeg.readFile('output.wav');
             const audioBlob = new Blob([audioData.buffer], { type: 'audio/wav' });
 
-            // 3. Whisper AI 실행 (Worker 호출)
-            status.innerText = "🤖 AI 음성 인식 시작 (최초 실행 시 모델 다운로드 1~2분 소요)...";
-            transcribe(audioBlob);
+            // 3. Whisper 음성 인식 (Worker)
+            log("AI 모델 작동 시작...");
+            runInference(audioBlob);
 
         } catch (e) {
-            console.error(e);
-            status.innerText = "❌ 오류 발생: " + e.message;
+            log("에러 발생: " + e.message);
             startBtn.disabled = false;
         }
     };
 
-    function transcribe(blob) {
-        // 별도 워커 생성 (UI 멈춤 방지)
+    function runInference(blob) {
+        const lang = document.getElementById('languageSelect').value;
+        
         const workerCode = `
             import { pipeline } from 'https://cdn.jsdelivr.net/npm/@xenova/transformers@2.17.2';
 
             self.onmessage = async (e) => {
+                const { blob, lang } = e.data;
+                const url = URL.createObjectURL(blob);
+
                 try {
-                    const transcriber = await pipeline('automatic-speech-recognition', 'Xenova/whisper-tiny');
-                    const url = URL.createObjectURL(e.data.blob);
-                    
-                    const result = await transcriber(url, { 
-                        chunk_length_s: 30, 
-                        stride_length_s: 5,
-                        language: 'korean',
-                        return_timestamps: true 
+                    const transcriber = await pipeline('automatic-speech-recognition', 'Xenova/whisper-tiny', {
+                        progress_callback: (p) => {
+                            self.postMessage({ status: 'progress', progress: p });
+                        }
+                    });
+
+                    const result = await transcriber(url, {
+                        language: lang === 'auto' ? null : lang,
+                        return_timestamps: true,
+                        chunk_length_s: 30,
+                        stride_length_s: 5
                     });
 
                     self.postMessage({ status: 'complete', result });
@@ -101,32 +157,44 @@
         `;
 
         const worker = new Worker(URL.createObjectURL(new Blob([workerCode], { type: 'application/javascript' })), { type: 'module' });
-        worker.postMessage({ blob });
+        worker.postMessage({ blob, lang });
 
         worker.onmessage = (e) => {
-            if (e.data.status === 'complete') {
-                finalSrt = makeSRT(e.data.result.chunks);
+            const { status, progress, result, error } = e.data;
+
+            if (status === 'progress') {
+                if (progress.status === 'downloading') {
+                    statusText.innerText = `모델 다운로드 중: ${Math.round(progress.progress)}%`;
+                    progressBar.style.width = `${progress.progress}%`;
+                } else if (progress.status === 'done') {
+                    log("모델 로드 완료, 연산 시작...");
+                }
+            } else if (status === 'complete') {
+                finalSrt = formatSRT(result.chunks);
                 output.innerText = finalSrt;
-                status.innerText = "✅ 완료!";
+                statusText.innerText = "자막 생성 완료!";
+                progressBar.style.width = "100%";
                 downloadBtn.disabled = false;
-            } else {
-                status.innerText = "❌ 인식 오류: " + e.data.error;
+                startBtn.disabled = false;
+                log("모든 작업이 완료되었습니다.");
+            } else if (status === 'error') {
+                log("인식 오류: " + error);
+                startBtn.disabled = false;
             }
-            startBtn.disabled = false;
         };
     }
 
-    function makeSRT(chunks) {
+    function formatSRT(chunks) {
         return chunks.map((c, i) => {
-            const start = formatTime(c.timestamp[0]);
-            const end = formatTime(c.timestamp[1] || c.timestamp[0] + 2);
-            return \`\${i + 1}\\n\${start} --> \${end}\\n\${c.text.trim()}\\n\\n\`;
+            const s = formatTime(c.timestamp[0]);
+            const e = formatTime(c.timestamp[1] || c.timestamp[0] + 2);
+            return \`\${i+1}\\n\${s} --> \${e}\\n\${c.text.trim()}\\n\\n\`;
         }).join('');
     }
 
-    function formatTime(s) {
-        const ms = Math.floor((s % 1) * 1000).toString().padStart(3, '0');
-        const hms = new Date(s * 1000).toISOString().substr(11, 8);
+    function formatTime(sec) {
+        const hms = new Date(sec * 1000).toISOString().substr(11, 8);
+        const ms = Math.floor((sec % 1) * 1000).toString().padStart(3, '0');
         return \`\${hms},\${ms}\`;
     }
 
@@ -134,7 +202,7 @@
         const blob = new Blob([finalSrt], { type: 'text/plain' });
         const a = document.createElement('a');
         a.href = URL.createObjectURL(blob);
-        a.download = "subtitles.srt";
+        a.download = "subtitle.srt";
         a.click();
     };
 </script>
