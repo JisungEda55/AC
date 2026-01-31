@@ -1,0 +1,157 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+    <meta charset="UTF-8">
+    <title>Light 자막 생성기 (Web Speech API 버전)</title>
+    <script src="https://cdn.jsdelivr.net/npm/@ffmpeg/ffmpeg@0.12.10/dist/umd/ffmpeg.umd.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@ffmpeg/util@0.12.1/dist/umd/index.min.js"></script>
+    <style>
+        body { font-family: 'Malgun Gothic', sans-serif; padding: 20px; background: #f9f9f9; }
+        .container { max-width: 600px; margin: auto; background: white; padding: 25px; border-radius: 15px; box-shadow: 0 4px 15px rgba(0,0,0,0.1); }
+        #log { background: #222; color: #00ff00; padding: 15px; height: 150px; overflow-y: auto; font-size: 13px; border-radius: 8px; margin: 15px 0; white-space: pre-wrap; }
+        button { width: 100%; padding: 12px; background: #4A90E2; color: white; border: none; border-radius: 8px; font-weight: bold; cursor: pointer; transition: 0.3s; }
+        button:disabled { background: #ccc; }
+        .result-area { margin-top: 20px; border-top: 2px solid #eee; padding-top: 15px; }
+        #srtPreview { width: 100%; height: 150px; background: #f0f0f0; border: 1px solid #ddd; padding: 10px; box-sizing: border-box; font-size: 12px; }
+    </style>
+</head>
+<body>
+
+<div class="container">
+    <h2>🎤 순수 브라우저 자막기</h2>
+    <p style="font-size: 0.9em; color: #666;">위스퍼 없이 브라우저 내장 기능으로 작동합니다.</p>
+    
+    <input type="file" id="videoInput" accept="video/*, audio/*">
+    <button id="startBtn">자막 받아쓰기 시작</button>
+    
+    <div id="log">준비 완료. 파일을 선택하세요.</div>
+    
+    <div class="result-area">
+        <strong>실시간 자막 결과:</strong>
+        <textarea id="srtPreview" readonly placeholder="이곳에 SRT 내용이 채워집니다..."></textarea>
+        <button id="downBtn" style="background:#28a745; margin-top:10px; display:none;">SRT 다운로드</button>
+    </div>
+</div>
+
+<audio id="audioPlayer" style="display:none;"></audio>
+
+<script type="module">
+    const { FFmpeg } = FFmpegWASM;
+    const { fetchFile, toBlobURL } = FFmpegUtil;
+    const ffmpeg = new FFmpeg();
+
+    const logDiv = document.getElementById('log');
+    const srtPreview = document.getElementById('srtPreview');
+    const startBtn = document.getElementById('startBtn');
+    const downBtn = document.getElementById('downBtn');
+    const audioPlayer = document.getElementById('audioPlayer');
+
+    let srtData = [];
+    let startTime = 0;
+
+    function addLog(msg) {
+        logDiv.innerText += `\n> ${msg}`;
+        logDiv.scrollTop = logDiv.scrollHeight;
+    }
+
+    startBtn.onclick = async () => {
+        const file = document.getElementById('videoInput').files[0];
+        if (!file) return alert("파일을 선택하세요!");
+
+        try {
+            startBtn.disabled = true;
+            srtData = [];
+            srtPreview.value = "";
+            addLog("시스템 가동 중...");
+
+            // 1. FFmpeg로 오디오 추출
+            if (!ffmpeg.loaded) {
+                await ffmpeg.load({
+                    coreURL: await toBlobURL('https://cdn.jsdelivr.net/npm/@ffmpeg/core@0.12.6/dist/umd/ffmpeg-core.js', 'text/javascript'),
+                    wasmURL: await toBlobURL('https://cdn.jsdelivr.net/npm/@ffmpeg/core@0.12.6/dist/umd/ffmpeg-core.wasm', 'application/wasm'),
+                });
+            }
+            addLog("오디오 데이터 분리 중...");
+            await ffmpeg.writeFile('input', await fetchFile(file));
+            await ffmpeg.exec(['-i', 'input', '-ar', '16000', '-ac', '1', 'output.mp3']);
+            const data = await ffmpeg.readFile('output.wav');
+            
+            // 2. 오디오를 플레이어에 세팅
+            const audioBlob = new Blob([data.buffer], { type: 'audio/wav' });
+            audioPlayer.src = URL.createObjectURL(audioBlob);
+
+            // 3. Web Speech API 설정
+            const Recognition = window.SpeechRecognition || window.webkitSpeechRecognition;
+            if (!Recognition) return alert("이 브라우저는 음성 인식을 지원하지 않습니다. (크롬 권장)");
+
+            const recognition = new Recognition();
+            recognition.lang = 'ko-KR';
+            recognition.continuous = true; // 계속 인식
+            recognition.interimResults = false; // 최종 결과만
+
+            recognition.onstart = () => {
+                addLog("받아쓰기 시작... (오디오 재생 중)");
+                startTime = Date.now();
+                audioPlayer.play();
+            };
+
+            recognition.onresult = (event) => {
+                const lastResult = event.results[event.results.length - 1];
+                const text = lastResult[0].transcript;
+                const currentTime = audioPlayer.currentTime;
+                
+                // 간단한 타임스탬프 계산 (현재 재생 지점 기반)
+                const entry = {
+                    index: srtData.length + 1,
+                    start: formatSRTTime(currentTime - 2 > 0 ? currentTime - 2 : 0),
+                    end: formatSRTTime(currentTime),
+                    text: text.trim()
+                };
+                
+                srtData.push(entry);
+                updatePreview();
+            };
+
+            recognition.onend = () => {
+                addLog("모든 인식이 종료되었습니다.");
+                downBtn.style.display = "block";
+                startBtn.disabled = false;
+            };
+
+            recognition.onerror = (e) => addLog("인식 오류: " + e.error);
+
+            // 인식 시작
+            recognition.start();
+
+        } catch (err) {
+            addLog("오류: " + err.message);
+            startBtn.disabled = false;
+        }
+    };
+
+    function updatePreview() {
+        srtPreview.value = srtData.map(d => 
+            `${d.index}\n${d.start} --> ${d.end}\n${d.text}\n`
+        ).join('\n');
+        srtPreview.scrollTop = srtPreview.scrollHeight;
+    }
+
+    function formatSRTTime(sec) {
+        const date = new Date(0);
+        date.setMilliseconds(sec * 1000);
+        const timePart = date.toISOString().substr(11, 8);
+        const msPart = Math.floor((sec % 1) * 1000).toString().padStart(3, '0');
+        return `${timePart},${msPart}`;
+    }
+
+    downBtn.onclick = () => {
+        const blob = new Blob([srtPreview.value], { type: 'text/plain' });
+        const a = document.createElement('a');
+        a.href = URL.createObjectURL(blob);
+        a.download = "subtitle.srt";
+        a.click();
+    };
+</script>
+
+</body>
+</html>
