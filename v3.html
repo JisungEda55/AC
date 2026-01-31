@@ -1,0 +1,155 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+    <meta charset="UTF-8">
+    <title>초간편 자막 생성기 (Low-Quality OK)</title>
+    <script src="https://cdn.jsdelivr.net/npm/@ffmpeg/ffmpeg@0.12.10/dist/umd/ffmpeg.umd.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@ffmpeg/util@0.12.1/dist/umd/index.min.js"></script>
+    <style>
+        body { font-family: sans-serif; line-height: 1.6; padding: 20px; background: #f4f4f4; color: #333; }
+        .box { background: white; max-width: 600px; margin: auto; padding: 20px; border-radius: 10px; shadow: 0 2px 5px rgba(0,0,0,0.1); }
+        #log { background: #000; color: #0f0; padding: 10px; height: 200px; overflow-y: auto; font-family: monospace; font-size: 12px; border-radius: 5px; white-space: pre-wrap; }
+        button { width: 100%; padding: 10px; margin: 10px 0; cursor: pointer; border: none; border-radius: 5px; background: #007bff; color: white; font-weight: bold; }
+        button:disabled { background: #ccc; }
+        progress { width: 100%; height: 20px; }
+    </style>
+</head>
+<body>
+
+<div class="box">
+    <h2>📟 초저사양 자막기</h2>
+    <p>저품질 모델(Tiny)을 사용하여 속도를 높였습니다.</p>
+    
+    <input type="file" id="fileInput" accept="video/*, audio/*">
+    <button id="runBtn">작업 시작 (자막 만들기)</button>
+    
+    <div id="status">상태: 대기 중</div>
+    <progress id="pg" value="0" max="100"></progress>
+    
+    <div id="log">로그가 여기에 표시됩니다...</div>
+    
+    <button id="downBtn" style="background:#28a745; display:none;">SRT 파일 다운로드</button>
+</div>
+
+<script type="module">
+    const { FFmpeg } = FFmpegWASM;
+    const { fetchFile, toBlobURL } = FFmpegUtil;
+    const ffmpeg = new FFmpeg();
+
+    const logDiv = document.getElementById('log');
+    const statusDiv = document.getElementById('status');
+    const pg = document.getElementById('pg');
+    const runBtn = document.getElementById('runBtn');
+    const downBtn = document.getElementById('downBtn');
+
+    let srtContent = "";
+
+    // 화면에 로그를 찍는 함수
+    function addLog(msg) {
+        logDiv.innerText += `\n> ${msg}`;
+        logDiv.scrollTop = logDiv.scrollHeight;
+    }
+
+    runBtn.onclick = async () => {
+        const file = document.getElementById('fileInput').files[0];
+        if (!file) return alert("파일을 선택하세요!");
+
+        try {
+            runBtn.disabled = true;
+            addLog("프로그램 시작...");
+
+            // 1. FFmpeg 로드
+            if (!ffmpeg.loaded) {
+                statusDiv.innerText = "상태: 라이브러리 로드 중...";
+                await ffmpeg.load({
+                    coreURL: await toBlobURL('https://cdn.jsdelivr.net/npm/@ffmpeg/core@0.12.6/dist/umd/ffmpeg-core.js', 'text/javascript'),
+                    wasmURL: await toBlobURL('https://cdn.jsdelivr.net/npm/@ffmpeg/core@0.12.6/dist/umd/ffmpeg-core.wasm', 'application/wasm'),
+                });
+            }
+
+            // 2. 오디오 추출
+            statusDiv.innerText = "상태: 오디오 추출 중 (FFmpeg)";
+            addLog("영상에서 소리만 뽑아내는 중...");
+            await ffmpeg.writeFile('input', await fetchFile(file));
+            await ffmpeg.exec(['-i', 'input', '-ar', '16000', '-ac', '1', 'audio.wav']);
+            const data = await ffmpeg.readFile('audio.wav');
+            const audioBlob = new Blob([data.buffer], { type: 'audio/wav' });
+
+            // 3. AI 인식 시작 (Worker 호출)
+            statusDiv.innerText = "상태: AI 분석 중 (Whisper Tiny)";
+            addLog("AI 모델 로딩 및 분석 시작 (최초 1회 다운로드)...");
+            startAI(audioBlob);
+
+        } catch (e) {
+            addLog("에러 발생: " + e.message);
+            runBtn.disabled = false;
+        }
+    };
+
+    function startAI(blob) {
+        // 워커 코드
+        const workerCode = `
+            import { pipeline } from 'https://cdn.jsdelivr.net/npm/@xenova/transformers@2.17.2';
+
+            self.onmessage = async (e) => {
+                try {
+                    // 가장 가벼운 tiny 모델 사용
+                    const transcriber = await pipeline('automatic-speech-recognition', 'Xenova/whisper-tiny', {
+                        progress_callback: (p) => { self.postMessage({ type: 'pg', p }); }
+                    });
+
+                    const url = URL.createObjectURL(e.data.blob);
+                    const result = await transcriber(url, { 
+                        language: 'korean', 
+                        return_timestamps: true,
+                        chunk_length_s: 30 
+                    });
+
+                    self.postMessage({ type: 'done', result });
+                } catch (err) {
+                    self.postMessage({ type: 'error', err: err.message });
+                }
+            };
+        `;
+
+        const worker = new Worker(URL.createObjectURL(new Blob([workerCode], { type: 'application/javascript' })), { type: 'module' });
+        worker.postMessage({ blob });
+
+        worker.onmessage = (e) => {
+            const res = e.data;
+            if (res.type === 'pg') {
+                if (res.p.status === 'downloading') {
+                    pg.value = res.p.progress;
+                    statusDiv.innerText = `모델 다운로드 중... (${Math.round(res.p.progress)}%)`;
+                }
+            } else if (res.type === 'done') {
+                statusDiv.innerText = "상태: 작업 완료!";
+                addLog("분석 완료! 자막을 생성합니다.");
+                
+                srtContent = res.result.chunks.map((c, i) => {
+                    const start = new Date(c.timestamp[0] * 1000).toISOString().substr(11, 12).replace('.', ',');
+                    const end = new Date((c.timestamp[1] || c.timestamp[0]+2) * 1000).toISOString().substr(11, 12).replace('.', ',');
+                    return `${i + 1}\n${start} --> ${end}\n${c.text.trim()}\n\n`;
+                }).join('');
+
+                addLog("결과물:\n" + srtContent.substring(0, 100) + "...");
+                downBtn.style.display = "block";
+                runBtn.disabled = false;
+            } else if (res.type === 'error') {
+                addLog("AI 오류: " + res.err);
+                runBtn.disabled = false;
+            }
+        };
+    }
+
+    downBtn.onclick = () => {
+        const blob = new Blob([srtContent], { type: 'text/plain' });
+        const a = document.createElement('a');
+        a.href = URL.createObjectURL(blob);
+        a.download = "subtitle.srt";
+        a.click();
+    };
+</script>
+
+</body>
+</html>
