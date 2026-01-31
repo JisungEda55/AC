@@ -1,0 +1,119 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="UTF-8">
+<title>Whisper WASM 자막 생성 (SRT)</title>
+<style>
+body { font-family: sans-serif; padding:20px }
+video { max-width:100%; margin:10px 0 }
+pre { background:#111; color:#0f0; padding:10px; white-space:pre-wrap }
+button { margin-right:10px }
+</style>
+</head>
+<body>
+
+<h2>동영상 → 자막(SRT) 생성</h2>
+<input type="file" id="videoInput" accept="video/*">
+<br><br>
+<button id="startBtn">자막 생성</button>
+<button id="downloadBtn" disabled>SRT 다운로드</button>
+
+<video id="video" controls></video>
+<h3>자막 미리보기</h3>
+<pre id="output">대기 중...</pre>
+
+<script type="module">
+import { createFFmpeg, fetchFile } from "https://unpkg.com/@ffmpeg/ffmpeg@0.12.6/dist/ffmpeg.min.js";
+
+const ffmpeg = createFFmpeg({ log: false });
+const video = document.getElementById("video");
+const output = document.getElementById("output");
+const downloadBtn = document.getElementById("downloadBtn");
+
+let videoFile;
+let srtText = "";
+
+document.getElementById("videoInput").onchange = e => {
+  videoFile = e.target.files[0];
+  video.src = URL.createObjectURL(videoFile);
+};
+
+document.getElementById("startBtn").onclick = async () => {
+  if (!videoFile) return alert("동영상을 선택하세요.");
+
+  output.textContent = "FFmpeg 로딩 중...";
+  if (!ffmpeg.isLoaded()) await ffmpeg.load();
+
+  // 1️⃣ 비디오 → 오디오
+  ffmpeg.FS("writeFile", "input.mp4", await fetchFile(videoFile));
+  await ffmpeg.run(
+    "-i", "input.mp4",
+    "-vn", "-ac", "1", "-ar", "16000",
+    "audio.wav"
+  );
+
+  const audioData = ffmpeg.FS("readFile", "audio.wav").buffer;
+
+  output.textContent = "Whisper 인식 중... (Worker)";
+  runWhisperWorker(audioData);
+};
+
+// ---------------- Worker ----------------
+function runWhisperWorker(audioBuffer) {
+  const workerCode = `
+    self.onmessage = async e => {
+      const audio = e.data;
+      const { default: whisper } = await import(
+        "https://cdn.jsdelivr.net/npm/whisper-web@latest/dist/whisper.min.js"
+      );
+      const model = await whisper.loadModel("tiny");
+      const result = await model.transcribe(audio, { language: "ko" });
+      self.postMessage(result.segments);
+    };
+  `;
+
+  const worker = new Worker(
+    URL.createObjectURL(new Blob([workerCode], { type: "text/javascript" }))
+  );
+
+  worker.postMessage(audioBuffer);
+
+  worker.onmessage = e => {
+    const segments = e.data;
+    srtText = buildSRT(segments);
+    output.textContent = srtText;
+    downloadBtn.disabled = false;
+  };
+}
+
+// ---------------- SRT 생성 ----------------
+function buildSRT(segments) {
+  return segments.map((seg, i) => {
+    return \`\${i+1}
+\${toTime(seg.start)} --> \${toTime(seg.end)}
+\${seg.text.trim()}
+
+\`;
+  }).join("");
+}
+
+function toTime(sec) {
+  const h = String(Math.floor(sec / 3600)).padStart(2, "0");
+  const m = String(Math.floor(sec % 3600 / 60)).padStart(2, "0");
+  const s = String(Math.floor(sec % 60)).padStart(2, "0");
+  const ms = String(Math.floor((sec % 1) * 1000)).padStart(3, "0");
+  return \`\${h}:\${m}:\${s},\${ms}\`;
+}
+
+// ---------------- 다운로드 ----------------
+downloadBtn.onclick = () => {
+  const blob = new Blob([srtText], { type: "text/plain" });
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(blob);
+  a.download = "subtitle.srt";
+  a.click();
+};
+</script>
+
+</body>
+</html>
