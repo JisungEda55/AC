@@ -1,0 +1,182 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Whisper WASM 자막 생성기</title>
+    <script src="https://cdn.jsdelivr.net/npm/@ffmpeg/ffmpeg@0.12.10/dist/umd/ffmpeg.umd.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@ffmpeg/util@0.12.1/dist/umd/index.min.js"></script>
+    <style>
+        body { font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; padding: 30px; line-height: 1.6; max-width: 800px; margin: 0 auto; background-color: #f4f4f9; }
+        .container { background: white; padding: 20px; border-radius: 12px; box-shadow: 0 4px 6px rgba(0,0,0,0.1); }
+        h2 { color: #333; border-bottom: 2px solid #eee; padding-bottom: 10px; }
+        video { width: 100%; border-radius: 8px; margin-top: 15px; display: none; }
+        #status { font-weight: bold; color: #007bff; margin: 15px 0; min-height: 24px; }
+        .controls { margin: 20px 0; display: flex; gap: 10px; }
+        button { padding: 10px 20px; border: none; border-radius: 6px; cursor: pointer; font-weight: bold; transition: 0.3s; }
+        #startBtn { background-color: #28a745; color: white; }
+        #startBtn:disabled { background-color: #ccc; }
+        #downloadBtn { background-color: #17a2b8; color: white; }
+        #downloadBtn:disabled { background-color: #ccc; }
+        pre { background: #2d2d2d; color: #f8f8f2; padding: 15px; border-radius: 8px; overflow-x: auto; max-height: 300px; font-size: 13px; }
+    </style>
+</head>
+<body>
+
+<div class="container">
+    <h2>🎙️ On-Device 자막 생성기</h2>
+    <p><small>서버 전송 없이 브라우저 내에서 모든 처리가 완료됩니다.</small></p>
+
+    <input type="file" id="videoInput" accept="video/*">
+    <video id="videoPlayer" controls></video>
+
+    <div class="controls">
+        <button id="startBtn">자막 추출 시작</button>
+        <button id="downloadBtn" disabled>SRT 다운로드</button>
+    </div>
+
+    <div id="status">파일을 선택하고 '시작'을 눌러주세요.</div>
+    
+    <h3>자막 미리보기</h3>
+    <pre id="output">이곳에 자막이 표시됩니다...</pre>
+</div>
+
+<script type="module">
+    // Transformers.js는 모듈 방식으로 가져오거나 워커 내부에서 가져옵니다.
+    // 여기서는 워커를 사용하여 UI 멈춤을 방지합니다.
+
+    const { FFmpeg } = FFmpegWASM;
+    const { fetchFile, toBlobURL } = FFmpegUtil;
+    
+    const ffmpeg = new FFmpeg();
+    const videoInput = document.getElementById('videoInput');
+    const videoPlayer = document.getElementById('videoPlayer');
+    const startBtn = document.getElementById('startBtn');
+    const downloadBtn = document.getElementById('downloadBtn');
+    const status = document.getElementById('status');
+    const output = document.getElementById('output');
+
+    let srtResult = "";
+
+    // 1. 비디오 선택 시 미리보기
+    videoInput.onchange = (e) => {
+        const file = e.target.files[0];
+        if (file) {
+            videoPlayer.src = URL.createObjectURL(file);
+            videoPlayer.style.display = "block";
+        }
+    };
+
+    // 2. 메인 실행 로직
+    startBtn.onclick = async () => {
+        const file = videoInput.files[0];
+        if (!file) return alert("파일을 먼저 선택하세요!");
+
+        try {
+            startBtn.disabled = true;
+            
+            // FFmpeg 로드
+            if (!ffmpeg.loaded) {
+                status.innerText = "⚡ FFmpeg 라이브러리 로드 중...";
+                await ffmpeg.load({
+                    coreURL: await toBlobURL('https://cdn.jsdelivr.net/npm/@ffmpeg/core@0.12.6/dist/umd/ffmpeg-core.js', 'text/javascript'),
+                    wasmURL: await toBlobURL('https://cdn.jsdelivr.net/npm/@ffmpeg/core@0.12.6/dist/umd/ffmpeg-core.wasm', 'application/wasm'),
+                });
+            }
+
+            // 오디오 추출 (16kHz, mono, wav)
+            status.innerText = "🔊 오디오 추출 및 변환 중...";
+            await ffmpeg.writeFile('input_video', await fetchFile(file));
+            await ffmpeg.exec(['-i', 'input_video', '-ar', '16000', '-ac', '1', '-c:a', 'pcm_s16le', 'output.wav']);
+            
+            const audioData = await ffmpeg.readFile('output.wav');
+            const audioBlob = new Blob([audioData.buffer], { type: 'audio/wav' });
+            const audioUrl = URL.createObjectURL(audioBlob);
+
+            // Whisper Worker 실행
+            status.innerText = "🧠 AI 모델 로드 및 음성 인식 중 (최초 실행 시 모델 다운로드로 인해 시간이 걸립니다)...";
+            runWhisper(audioBlob);
+
+        } catch (err) {
+            console.error(err);
+            status.innerText = "❌ 오류 발생: " + err.message;
+            startBtn.disabled = false;
+        }
+    };
+
+    // 3. Whisper (Transformers.js) Web Worker 처리
+    function runWhisper(blob) {
+        // 워커 코드를 문자열로 작성하여 Blob 객체로 만듦 (단일 파일 유지)
+        const workerCode = `
+            import { pipeline } from 'https://cdn.jsdelivr.net/npm/@xenova/transformers@2.17.2';
+
+            self.onmessage = async (e) => {
+                const { audioUrl } = e.data;
+                
+                try {
+                    // Whisper 'tiny' 모델 파이프라인 생성 (한국어 타겟)
+                    const transcriber = await pipeline('automatic-speech-recognition', 'Xenova/whisper-tiny');
+                    
+                    const result = await transcriber(audioUrl, { 
+                        language: 'korean',
+                        chunk_length_s: 30,
+                        stride_length_s: 5,
+                        return_timestamps: true 
+                    });
+
+                    self.postMessage({ status: 'success', data: result });
+                } catch (err) {
+                    self.postMessage({ status: 'error', message: err.message });
+                }
+            };
+        `;
+
+        const workerBlob = new Blob([workerCode], { type: 'application/javascript' });
+        const worker = new Worker(URL.createObjectURL(workerBlob), { type: 'module' });
+
+        worker.postMessage({ audioUrl: URL.createObjectURL(blob) });
+
+        worker.onmessage = (e) => {
+            if (e.data.status === 'success') {
+                const result = e.data.data;
+                srtResult = convertToSRT(result.chunks);
+                output.textContent = srtResult;
+                status.innerText = "✅ 자막 생성 완료!";
+                downloadBtn.disabled = false;
+            } else {
+                status.innerText = "❌ 인식 실패: " + e.data.message;
+            }
+            startBtn.disabled = false;
+        };
+    }
+
+    // 4. SRT 포맷 변환 함수
+    function convertToSRT(chunks) {
+        return chunks.map((chunk, index) => {
+            const start = formatTime(chunk.timestamp[0]);
+            const end = formatTime(chunk.timestamp[1] || chunk.timestamp[0] + 2);
+            return \`\${index + 1}\\n\${start} --> \${end}\\n\${chunk.text.trim()}\\n\\n\`;
+        }).join('');
+    }
+
+    function formatTime(seconds) {
+        const date = new Date(0);
+        date.setMilliseconds(seconds * 1000);
+        const timePart = date.toISOString().substr(11, 8);
+        const msPart = Math.floor((seconds % 1) * 1000).toString().padStart(3, '0');
+        return \`\${timePart},\${msPart}\`;
+    }
+
+    // 5. 다운로드 기능
+    downloadBtn.onclick = () => {
+        const blob = new Blob([srtResult], { type: 'text/plain' });
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = "subtitle.srt";
+        a.click();
+    };
+</script>
+
+</body>
+</html>
